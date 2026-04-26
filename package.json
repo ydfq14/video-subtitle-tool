@@ -1,0 +1,54 @@
+{
+  "name": "local-subtitle-tool",
+  "version": "1.0.0",
+  "description": "智能字幕工坊 - 本地视频字幕生成工具",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:renderer\" \"npm run dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:electron": "node scripts/wait-vite.js && electron .",
+    "build": "vite build && electron-builder --win portable",
+    "build:dir": "vite build && electron-builder --win --dir"
+  },
+  "dependencies": {
+    "electron-log": "^5.0.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "concurrently": "^8.2.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "sass": "^1.69.5",
+    "vite": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.localsubtitle.tool",
+    "productName": "智能字幕工坊",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "scripts/**/*"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "public/icon.ico"
+    },
+    "portable": {
+      "artifactName": "智能字幕工坊-Portable.exe"
+    },
+    "extraResources": [
+      {
+        "from": "python/",
+        "to": "python/",
+        "filter": ["**/*"]
+      }
+    ],
+    "asar": true
+  }
+}

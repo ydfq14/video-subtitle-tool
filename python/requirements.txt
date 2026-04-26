@@ -1,0 +1,4 @@
+# 智能字幕工坊 - Python 依赖
+PyQt5>=5.15.0
+openai-whisper>=1.16.0
+numpy>=1.24.0
