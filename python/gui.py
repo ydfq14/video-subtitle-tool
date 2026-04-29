@@ -22,67 +22,336 @@ from datetime import datetime, timezone
 _last_translate_time = 0
 _translate_min_interval = 0.5  # 每秒最多 2 次
 
-# 翻译上下文：保留前一条字幕用于优化翻译
-_translation_context = ""
-_context_max_length = 100  # 上下文最大长度
-
 # 最大队列长度
 MAX_QUEUE_SIZE = 10
+
+# 配置文件路径
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config.json')
+
+def load_settings():
+    """从配置文件加载设置"""
+    default_settings = {
+        'secret_id': '',
+        'secret_key': '',
+        'output_dir': '',
+        'model_path': '',
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+                default_settings.update(saved)
+        except Exception as e:
+            print(f"[设置] 加载配置失败: {e}")
+    return default_settings
+
+def save_settings(settings):
+    """保存设置到配置文件"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[设置] 保存配置失败: {e}")
+
+# 全局设置
+_app_settings = load_settings()
 
 # -*- coding: utf-8 -*-
 import io
 
 # 修复 Windows 控制台编码
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 
-# 尝试导入 PyQt5
+# 尝试导入 PyQt5（仅导入，不自动安装）
 try:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-        QComboBox, QMessageBox, QGroupBox, QListWidget
+        QComboBox, QMessageBox, QGroupBox, QListWidget,
+        QLineEdit, QDialog, QFormLayout, QDialogButtonBox
     )
-    from PyQt5.QtCore import Qt, pyqtSignal, QObject
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtCore import Qt, pyqtSignal, QObject, QSize
+    from PyQt5.QtGui import QFont, QIcon, QPixmap
     PYQT5_AVAILABLE = True
 except ImportError:
     PYQT5_AVAILABLE = False
-    os.system('pip install PyQt5 -q')
-    from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
-        QComboBox, QMessageBox, QGroupBox, QListWidget
-    )
-    from PyQt5.QtCore import Qt, pyqtSignal, QObject
-    from PyQt5.QtGui import QFont
 
 def check_dependencies():
-    print("[OK] PyQt5 is installed")
+    """检查并自动安装缺失的环境依赖，返回 True 表示全部就绪"""
+    results = []  # [(名称, 状态, 详情)]
+    all_ok = True
+
+    # 1. 检查 Python 包依赖
+    required_packages = [
+        ('PyQt5', 'PyQt5>=5.15.0'),
+        ('whisper', 'openai-whisper'),
+        ('numpy', 'numpy'),
+    ]
+
+    for module_name, pip_name in required_packages:
+        try:
+            __import__(module_name)
+            results.append((module_name, 'ok', '已安装'))
+        except ImportError:
+            results.append((module_name, 'installing', f'正在安装 {pip_name}...'))
+            all_ok = False
+
+    # 2. 检查 FFmpeg
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        print("[OK] FFmpeg is installed")
-    except:
-        print("[WARNING] FFmpeg not found")
+        results.append(('FFmpeg', 'ok', '已安装'))
+    except Exception:
+        results.append(('FFmpeg', 'warning', '未安装，字幕合成功能将不可用'))
 
-def translate_text_to_chinese(text, from_lang='ja', context=''):
+    # 如果全部 OK，不需要展示检测界面
+    if all_ok:
+        for name, status, detail in results:
+            print(f"[环境] {name}: {detail}")
+        return True
+
+    # 有缺失依赖，展示 GUI 安装界面
+    return _show_env_check_ui(results, required_packages)
+
+
+def _show_env_check_ui(results, required_packages):
+    """展示环境检测 GUI 并自动安装缺失依赖"""
+    if not PYQT5_AVAILABLE:
+        # PyQt5 缺失，先用命令行安装
+        print("[环境] PyQt5 未安装，正在自动安装...")
+        _pip_install('PyQt5>=5.15.0')
+        print("[环境] PyQt5 安装完成，请重新运行程序。")
+        try:
+            input("按回车键退出...")
+        except:
+            pass
+        return False
+
+    # 创建临时 QApplication（可能还没有）
+    app = None
+    if QApplication.instance() is None:
+        app = QApplication(sys.argv)
+
+    # 构建检测界面
+    dialog = QDialog()
+    dialog.setWindowTitle('智能字幕工坊 - 环境检测')
+    dialog.setMinimumWidth(480)
+    dialog.setMinimumHeight(360)
+    dialog.setModal(True)
+    dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowCloseButtonHint)
+
+    dialog.setStyleSheet("""
+        QDialog {
+            background-color: #f0f2f5;
+        }
+        QLabel#title {
+            font-size: 20px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        QLabel#subtitle {
+            font-size: 12px;
+            color: #95a5a6;
+        }
+        QFrame#card {
+            background-color: white;
+            border-radius: 10px;
+            border: none;
+        }
+        QLabel#item_name {
+            font-size: 13px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        QLabel#item_status {
+            font-size: 12px;
+        }
+        QPushButton#close_btn {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 40px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        QPushButton#close_btn:hover {
+            background-color: #2e86c1;
+        }
+    """)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(28, 24, 28, 24)
+    layout.setSpacing(14)
+
+    # 标题
+    title = QLabel('🔍 环境检测')
+    title.setObjectName('title')
+    layout.addWidget(title)
+
+    subtitle = QLabel('正在检查运行环境，自动安装缺失的依赖...')
+    subtitle.setObjectName('subtitle')
+    layout.addWidget(subtitle)
+
+    layout.addSpacing(6)
+
+    # 状态卡片
+    card = QFrame()
+    card.setObjectName('card')
+    card_layout = QVBoxLayout(card)
+    card_layout.setContentsMargins(20, 16, 20, 16)
+    card_layout.setSpacing(10)
+
+    status_labels = {}
+    for name, status, detail in results:
+        row = QHBoxLayout()
+        name_label = QLabel(f'  {name}')
+        name_label.setObjectName('item_name')
+        name_label.setMinimumWidth(100)
+        row.addWidget(name_label)
+
+        status_label = QLabel(detail)
+        status_label.setObjectName('item_status')
+        if status == 'ok':
+            status_label.setStyleSheet('color: #27ae60; font-weight: bold;')
+            status_label.setText('✅ 已安装')
+        elif status == 'installing':
+            status_label.setStyleSheet('color: #f39c12; font-weight: bold;')
+            status_label.setText('⏳ 准备安装...')
+        elif status == 'warning':
+            status_label.setStyleSheet('color: #e74c3c; font-weight: bold;')
+            status_label.setText('⚠️ ' + detail)
+        row.addWidget(status_label)
+        row.addStretch()
+        card_layout.addLayout(row)
+        status_labels[name] = status_label
+
+    layout.addWidget(card)
+
+    # 进度条
+    progress = QProgressBar()
+    progress.setRange(0, 100)
+    progress.setValue(0)
+    progress.setTextVisible(False)
+    progress.setFixedHeight(4)
+    progress.setStyleSheet("""
+        QProgressBar {
+            background-color: #e0e0e0;
+            border-radius: 2px;
+            border: none;
+        }
+        QProgressBar::chunk {
+            background-color: #3498db;
+            border-radius: 2px;
+        }
+    """)
+    layout.addWidget(progress)
+
+    layout.addSpacing(6)
+
+    # 日志区域
+    log_text = QTextEdit()
+    log_text.setReadOnly(True)
+    log_text.setMaximumHeight(80)
+    log_text.setStyleSheet("""
+        QTextEdit {
+            background-color: #2c3e50;
+            color: #ecf0f1;
+            border-radius: 8px;
+            border: none;
+            font-family: Consolas, 'Microsoft YaHei';
+            font-size: 11px;
+            padding: 8px;
+        }
+    """)
+    layout.addWidget(log_text)
+
+    # 关闭按钮（默认隐藏）
+    close_btn = QPushButton('启动程序')
+    close_btn.setObjectName('close_btn')
+    close_btn.setCursor(Qt.PointingHandCursor)
+    close_btn.setVisible(False)
+    close_btn.clicked.connect(dialog.accept)
+    layout.addWidget(close_btn, alignment=Qt.AlignCenter)
+
+    dialog.show()
+
+    # 执行安装
+    def do_install():
+        total = len(results)
+        done = 0
+
+        for name, status, detail in results:
+            if status != 'installing':
+                done += 1
+                progress.setValue(int(done / total * 100))
+                continue
+
+            # 找到对应的 pip 包名
+            pip_name = ''
+            for module_name, pname in required_packages:
+                if module_name == name:
+                    pip_name = pname
+                    break
+
+            status_labels[name].setText('⏳ 正在安装...')
+            log_text.append(f'[安装] {pip_name} ...')
+            QApplication.processEvents()
+
+            success = _pip_install(pip_name)
+            if success:
+                status_labels[name].setText('✅ 安装成功')
+                status_labels[name].setStyleSheet('color: #27ae60; font-weight: bold;')
+                log_text.append(f'[完成] {pip_name} 安装成功')
+            else:
+                status_labels[name].setText('❌ 安装失败')
+                status_labels[name].setStyleSheet('color: #e74c3c; font-weight: bold;')
+                log_text.append(f'[错误] {pip_name} 安装失败，请手动执行: pip install {pip_name}')
+
+            done += 1
+            progress.setValue(int(done / total * 100))
+            QApplication.processEvents()
+
+        subtitle.setText('环境检测完成')
+        close_btn.setVisible(True)
+
+    # 延迟执行安装（让界面先显示）
+    from PyQt5.QtCore import QTimer
+    QTimer.singleShot(500, do_install)
+
+    dialog.exec_()
+
+    if app is not None:
+        app.quit()
+
+    return True  # 即使有安装失败也继续运行，让主界面提示
+
+
+def _pip_install(package_name):
+    """执行 pip install，返回是否成功"""
+    try:
+        result = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', package_name, '-q'],
+            capture_output=True, text=True, timeout=300
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"[安装错误] {e}")
+        return False
+
+def translate_text_to_chinese(text, from_lang='ja'):
     """使用腾讯云机器翻译 API 将文本翻译为简体中文
     环境变量 SecretId 和 SecretKey 需要提前设置
-
-    改进翻译准确率：
-    1. 添加上下文参考（前一两句）
-    2. 优化提示词风格
-    3. 增加文本长度限制到 1000 字符
     """
     if not text or not text.strip():
         return text
 
-    SECRET_ID = os.environ.get('SecretId', '')
-    SECRET_KEY = os.environ.get('SecretKey', '')
+    SECRET_ID = _app_settings.get('secret_id', '') or os.environ.get('SecretId', '')
+    SECRET_KEY = _app_settings.get('secret_key', '') or os.environ.get('SecretKey', '')
 
     if not SECRET_ID or not SECRET_KEY:
-        print("[翻译] 未配置环境变量 SecretId/SecretKey，使用原文")
+        print("[翻译] 未配置 SecretId/SecretKey，使用原文")
         return text
 
     # 腾讯云 TMT API 参数
@@ -91,28 +360,19 @@ def translate_text_to_chinese(text, from_lang='ja', context=''):
     endpoint = f"https://{host}"
     action = "TextTranslate"
     version = "2018-03-21"
-    region = "ap-guangzhou"  # 翻译接口不区分地域，可固定
+    region = "ap-guangzhou"
 
-    # 源语言和目标语言（转换为 API 需要的代码）
-    # 支持 Whisper 返回的 ISO 639-1 代码 (ja, en, zh) 和完整名称 (japanese, english, chinese)
+    # 源语言和目标语言
     lang_code_map = {
         'japanese': 'ja', 'ja': 'ja',
         'english': 'en', 'en': 'en',
         'chinese': 'zh', 'zh': 'zh'
     }
     from_lang_code = lang_code_map.get(from_lang, 'en')
-    target_lang = 'zh'  # 简体中文（不是 zh-CHS）
+    target_lang = 'zh'
 
-    print(f"[翻译] from_lang={from_lang}, from_lang_code={from_lang_code}")  # 调试日志
-
-    # 限制文本长度（单次请求最大 2000 字符，这里取 1000 确保安全）
-    source_text = text[:1000]
-
-    # 如果有上下文，在文本前加上参考（帮助翻译器理解语境）
-    if context:
-        # 只取最后一小段上下文
-        context_hint = f"[参考上文：{context[-_context_max_length:]}] "
-        source_text = context_hint + source_text
+    # 清理文本：去除前后空白和多余空格
+    source_text = text.strip()[:1000]
 
     # 请求参数
     payload = json.dumps({
@@ -191,7 +451,14 @@ def translate_text_to_chinese(text, from_lang='ja', context=''):
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             if "Response" in result and "TargetText" in result["Response"]:
-                return result["Response"]["TargetText"]
+                translated = result["Response"]["TargetText"]
+                # 清理翻译结果中的可能残留内容
+                import re
+                # 去除 [参考上文：...] 或类似括号标记
+                translated = re.sub(r'\[参考[^]]*\]', '', translated).strip()
+                # 去除多余空格
+                translated = re.sub(r'\s{2,}', ' ', translated).strip()
+                return translated
             else:
                 print(f"[翻译] API 返回异常: {result}")
                 return text
@@ -219,23 +486,29 @@ class Worker(QObject):
         self._cancel_requested = True
 
     def run(self):
-        global _translation_context
         try:
             import whisper
 
             self.progress.emit({'status': 'loading', 'message': '正在加载 Whisper 模型...', 'percent': 5})
 
-            model_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                'whisper', 'medium.pt'
-            )
-
-            if os.path.exists(model_path):
-                self.progress.emit({'status': 'loading', 'message': f'正在加载本地模型 ({self.device})...', 'percent': 20})
-                model = whisper.load_model(model_path, device=self.device)
+            # 确定模型路径：优先使用用户设置的自定义路径
+            custom_model_path = _app_settings.get('model_path', '').strip()
+            if custom_model_path and os.path.exists(custom_model_path):
+                # 用户指定了自定义模型路径且文件存在
+                self.progress.emit({'status': 'loading', 'message': f'正在加载自定义模型 ({self.device})...', 'percent': 15})
+                model = whisper.load_model(custom_model_path, device=self.device)
             else:
-                self.progress.emit({'status': 'loading', 'message': f'正在下载 medium 模型 ({self.device})...', 'percent': 20})
-                model = whisper.load_model("medium", device=self.device)
+                # 检查项目目录下的默认模型
+                model_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    'whisper', 'medium.pt'
+                )
+                if os.path.exists(model_path):
+                    self.progress.emit({'status': 'loading', 'message': f'正在加载本地模型 ({self.device})...', 'percent': 20})
+                    model = whisper.load_model(model_path, device=self.device)
+                else:
+                    self.progress.emit({'status': 'loading', 'message': f'正在下载 medium 模型 ({self.device})...', 'percent': 20})
+                    model = whisper.load_model("medium", device=self.device)
 
             self.progress.emit({'status': 'transcribing', 'message': '正在识别语音...', 'percent': 30})
 
@@ -262,9 +535,6 @@ class Worker(QObject):
             else:
                 self.progress.emit({'status': 'processing', 'message': '正在处理结果...', 'percent': 70})
 
-            # 重置翻译上下文
-            _translation_context = ""
-
             # 处理片段（翻译）
             segments = []
             for i, seg in enumerate(seg_list):
@@ -281,17 +551,7 @@ class Worker(QObject):
                     # 翻译阶段进度: 60% - 95%
                     trans_percent = 60 + int((i + 1) / total_segs * 35) if total_segs > 0 else 90
                     self.progress.emit({'status': 'translating', 'message': f'正在翻译 [{i+1}/{total_segs}]: {original_text[:15]}...', 'percent': trans_percent})
-                    # 传入上下文用于优化翻译，使用检测到的语言
-                    translated_text = translate_text_to_chinese(original_text, detected_lang, _translation_context)
-
-                    # 更新上下文（保留最近的几条字幕）
-                    if _translation_context:
-                        _translation_context += " " + original_text
-                    else:
-                        _translation_context = original_text
-                    # 限制上下文长度
-                    if len(_translation_context) > 300:
-                        _translation_context = _translation_context[-200:]
+                    translated_text = translate_text_to_chinese(original_text, detected_lang)
 
                 segments.append({
                     'id': len(segments) + 1,
@@ -314,6 +574,367 @@ class Worker(QObject):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+
+
+class SettingsDialog(QDialog):
+    """设置对话框 - 现代卡片式设计"""
+    settings_changed = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('设置')
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(540)
+        self.setModal(True)
+        self._init_ui()
+        self._load_current_settings()
+
+    def _init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f0f2f5;
+            }
+            /* 头部 */
+            QLabel#header_icon {
+                font-size: 32px;
+            }
+            QLabel#header_title {
+                font-size: 22px;
+                font-weight: bold;
+                color: #2c3e50;
+            }
+            QLabel#header_subtitle {
+                font-size: 13px;
+                color: #95a5a6;
+            }
+            /* 卡片 */
+            QFrame#card {
+                background-color: white;
+                border-radius: 12px;
+                border: none;
+            }
+            /* 卡片标题 */
+            QLabel#card_title {
+                font-size: 16px;
+                font-weight: bold;
+                color: #2c3e50;
+                padding: 0px;
+            }
+            QLabel#card_desc {
+                font-size: 13px;
+                color: #95a5a6;
+                padding: 0px;
+            }
+            /* 表单标签 */
+            QLabel#field_label {
+                font-size: 13px;
+                font-weight: bold;
+                color: #5d6d7e;
+            }
+            /* 输入框 */
+            QLineEdit {
+                border: 1.5px solid #dce1e8;
+                border-radius: 8px;
+                padding: 9px 12px;
+                font-size: 14px;
+                background-color: #fafbfc;
+                color: #2c3e50;
+                selection-background-color: #3498db;
+            }
+            QLineEdit:focus {
+                border-color: #3498db;
+                background-color: white;
+            }
+            QLineEdit::placeholder {
+                color: #b0b8c4;
+            }
+            /* 浏览按钮 */
+            QPushButton#browse_btn {
+                background-color: #eaf2f8;
+                color: #2e86c1;
+                border: 1.5px solid #aed6f1;
+                border-radius: 8px;
+                padding: 7px 14px;
+                font-size: 13px;
+                font-weight: bold;
+                min-width: 70px;
+            }
+            QPushButton#browse_btn:hover {
+                background-color: #d4e6f1;
+                border-color: #3498db;
+            }
+            QPushButton#browse_btn:pressed {
+                background-color: #a9cce3;
+            }
+            /* 底部按钮 */
+            QPushButton#save_btn {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 30px;
+                font-size: 14px;
+                font-weight: bold;
+                min-width: 100px;
+            }
+            QPushButton#save_btn:hover {
+                background-color: #2e86c1;
+            }
+            QPushButton#save_btn:pressed {
+                background-color: #2471a3;
+            }
+            QPushButton#cancel_btn {
+                background-color: white;
+                color: #7f8c8d;
+                border: 1.5px solid #dce1e8;
+                border-radius: 8px;
+                padding: 10px 30px;
+                font-size: 14px;
+                font-weight: bold;
+                min-width: 100px;
+            }
+            QPushButton#cancel_btn:hover {
+                background-color: #f5f6fa;
+                border-color: #bdc3c7;
+                color: #2c3e50;
+            }
+        """)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(24, 20, 24, 20)
+        main_layout.setSpacing(16)
+
+        # ========== 头部 ==========
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
+        icon_label = QLabel('⚙️')
+        icon_label.setObjectName('header_icon')
+        header_layout.addWidget(icon_label)
+
+        header_text = QWidget()
+        header_text_layout = QVBoxLayout(header_text)
+        header_text_layout.setContentsMargins(10, 0, 0, 0)
+        header_text_layout.setSpacing(2)
+
+        title_label = QLabel('应用设置')
+        title_label.setObjectName('header_title')
+        header_text_layout.addWidget(title_label)
+
+        sub_label = QLabel('配置翻译 API、输出路径和模型选项')
+        sub_label.setObjectName('header_subtitle')
+        header_text_layout.addWidget(sub_label)
+
+        header_layout.addWidget(header_text, 1)
+        main_layout.addWidget(header)
+
+        # ========== 卡片 1: 翻译 API ==========
+        api_card = self._create_card()
+
+        card1_header = QHBoxLayout()
+        card1_title = QLabel('🔑  翻译 API 配置')
+        card1_title.setObjectName('card_title')
+        card1_header.addWidget(card1_title)
+        card1_header.addStretch()
+
+        self.credential_status = QLabel('●  未配置')
+        self.credential_status.setObjectName('credential_status')
+        self.credential_status.setStyleSheet('font-size: 12px; color: #e74c3c; font-weight: bold;')
+        card1_header.addWidget(self.credential_status)
+
+        card1_desc = QLabel('腾讯云机器翻译服务，用于将日/英语字幕翻译为简体中文')
+        card1_desc.setObjectName('card_desc')
+        card1_desc.setWordWrap(True)
+
+        api_card_layout = QVBoxLayout()
+        api_card_layout.setContentsMargins(20, 16, 20, 20)
+        api_card_layout.setSpacing(10)
+        api_card_layout.addLayout(card1_header)
+        api_card_layout.addWidget(card1_desc)
+
+        # SecretId
+        sid_label = QLabel('Secret ID')
+        sid_label.setObjectName('field_label')
+        api_card_layout.addWidget(sid_label)
+        self.secret_id_edit = QLineEdit()
+        self.secret_id_edit.setPlaceholderText('请输入腾讯云 SecretId')
+        self.secret_id_edit.setEchoMode(QLineEdit.Password)
+        self.secret_id_edit.textChanged.connect(self._update_credential_status)
+        api_card_layout.addWidget(self.secret_id_edit)
+
+        # SecretKey
+        skey_label = QLabel('Secret Key')
+        skey_label.setObjectName('field_label')
+        api_card_layout.addWidget(skey_label)
+        self.secret_key_edit = QLineEdit()
+        self.secret_key_edit.setPlaceholderText('请输入腾讯云 SecretKey')
+        self.secret_key_edit.setEchoMode(QLineEdit.Password)
+        self.secret_key_edit.textChanged.connect(self._update_credential_status)
+        api_card_layout.addWidget(self.secret_key_edit)
+
+        api_card.setLayout(api_card_layout)
+        main_layout.addWidget(api_card)
+
+        # ========== 卡片 2: 输出目录 ==========
+        output_card = self._create_card()
+
+        output_card_layout = QVBoxLayout()
+        output_card_layout.setContentsMargins(20, 16, 20, 20)
+        output_card_layout.setSpacing(10)
+
+        out_header = QHBoxLayout()
+        out_title = QLabel('📂  输出目录')
+        out_title.setObjectName('card_title')
+        out_header.addWidget(out_title)
+        out_header.addStretch()
+
+        out_desc = QLabel('字幕文件和合成视频的保存位置，留空则使用项目目录下的 output 文件夹')
+        out_desc.setObjectName('card_desc')
+        out_desc.setWordWrap(True)
+        out_header.addWidget(out_desc)
+        out_header.addStretch()
+
+        output_card_layout.addLayout(out_header)
+
+        out_row = QHBoxLayout()
+        out_row.setSpacing(8)
+        self.output_dir_edit = QLineEdit()
+        self.output_dir_edit.setPlaceholderText('默认：项目目录 / output')
+        out_row.addWidget(self.output_dir_edit, 1)
+
+        output_browse_btn = QPushButton('浏览...')
+        output_browse_btn.setObjectName('browse_btn')
+        output_browse_btn.clicked.connect(self._browse_output_dir)
+        out_row.addWidget(output_browse_btn)
+
+        output_card_layout.addLayout(out_row)
+        output_card.setLayout(output_card_layout)
+        main_layout.addWidget(output_card)
+
+        # ========== 卡片 3: 模型路径 ==========
+        model_card = self._create_card()
+
+        model_card_layout = QVBoxLayout()
+        model_card_layout.setContentsMargins(20, 16, 20, 20)
+        model_card_layout.setSpacing(10)
+
+        mdl_header = QHBoxLayout()
+        mdl_title = QLabel('🧠  Whisper 模型路径')
+        mdl_title.setObjectName('card_title')
+        mdl_header.addWidget(mdl_title)
+        mdl_header.addStretch()
+
+        mdl_desc = QLabel('留空使用默认位置自动下载；指定路径则从该位置加载 .pt 模型文件')
+        mdl_desc.setObjectName('card_desc')
+        mdl_desc.setWordWrap(True)
+        mdl_header.addWidget(mdl_desc)
+        mdl_header.addStretch()
+
+        model_card_layout.addLayout(mdl_header)
+
+        mdl_row = QHBoxLayout()
+        mdl_row.setSpacing(8)
+        self.model_path_edit = QLineEdit()
+        self.model_path_edit.setPlaceholderText('默认：Whisper 自动下载目录')
+        mdl_row.addWidget(self.model_path_edit, 1)
+
+        model_browse_btn = QPushButton('浏览...')
+        model_browse_btn.setObjectName('browse_btn')
+        model_browse_btn.clicked.connect(self._browse_model_path)
+        mdl_row.addWidget(model_browse_btn)
+
+        model_card_layout.addLayout(mdl_row)
+        model_card.setLayout(model_card_layout)
+        main_layout.addWidget(model_card)
+
+        # ========== 底部按钮 ==========
+        main_layout.addSpacing(4)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton('取消')
+        cancel_btn.setObjectName('cancel_btn')
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton('保存设置')
+        save_btn.setObjectName('save_btn')
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.clicked.connect(self._on_save)
+        btn_layout.addWidget(save_btn)
+
+        main_layout.addLayout(btn_layout)
+
+    def _create_card(self):
+        """创建白色圆角卡片"""
+        from PyQt5.QtWidgets import QFrame
+        frame = QFrame()
+        frame.setObjectName('card')
+        return frame
+
+    def _update_credential_status(self):
+        """实时更新凭证状态指示"""
+        sid = self.secret_id_edit.text().strip()
+        skey = self.secret_key_edit.text().strip()
+        has_env_id = bool(os.environ.get('SecretId', ''))
+        has_env_key = bool(os.environ.get('SecretKey', ''))
+
+        if (sid and skey):
+            self.credential_status.setText('●  已配置')
+            self.credential_status.setStyleSheet('font-size: 12px; color: #27ae60; font-weight: bold;')
+        elif (not sid and not skey) and (has_env_id and has_env_key):
+            self.credential_status.setText('●  使用环境变量')
+            self.credential_status.setStyleSheet('font-size: 12px; color: #f39c12; font-weight: bold;')
+        elif sid or skey:
+            self.credential_status.setText('●  不完整')
+            self.credential_status.setStyleSheet('font-size: 12px; color: #e67e22; font-weight: bold;')
+        else:
+            self.credential_status.setText('●  未配置')
+            self.credential_status.setStyleSheet('font-size: 12px; color: #e74c3c; font-weight: bold;')
+
+    def _load_current_settings(self):
+        """加载当前设置到界面"""
+        settings = load_settings()
+        self.secret_id_edit.setText(settings.get('secret_id', ''))
+        self.secret_key_edit.setText(settings.get('secret_key', ''))
+        self.output_dir_edit.setText(settings.get('output_dir', ''))
+        self.model_path_edit.setText(settings.get('model_path', ''))
+        self._update_credential_status()
+
+    def _browse_output_dir(self):
+        """浏览选择输出目录"""
+        current = self.output_dir_edit.text() or ''
+        dir_path = QFileDialog.getExistingDirectory(self, '选择输出目录', current)
+        if dir_path:
+            self.output_dir_edit.setText(dir_path)
+
+    def _browse_model_path(self):
+        """浏览选择模型文件"""
+        current = self.model_path_edit.text() or ''
+        start_dir = os.path.dirname(current) if os.path.isfile(current) else current
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, '选择 Whisper 模型文件', start_dir,
+            '模型文件 (*.pt);;所有文件 (*)'
+        )
+        if file_path:
+            self.model_path_edit.setText(file_path)
+
+    def _on_save(self):
+        """保存设置"""
+        global _app_settings
+        new_settings = {
+            'secret_id': self.secret_id_edit.text().strip(),
+            'secret_key': self.secret_key_edit.text().strip(),
+            'output_dir': self.output_dir_edit.text().strip(),
+            'model_path': self.model_path_edit.text().strip(),
+        }
+        save_settings(new_settings)
+        _app_settings.update(new_settings)
+        self.settings_changed.emit(new_settings)
+        self.accept()
 
 
 class BurnWorker(QObject):
@@ -435,9 +1056,12 @@ class MainWindow(QMainWindow):
         self.segments = []
 
         # 输出目录设置（必须在 init_ui 之前）
-        self.output_dir = self._get_default_output_dir()
-
-        self.init_ui()
+        self.model_custom_path = _app_settings.get('model_path', '').strip()
+        custom_output = _app_settings.get('output_dir', '').strip()
+        if custom_output and os.path.isdir(custom_output):
+            self.output_dir = custom_output
+        else:
+            self.output_dir = self._get_default_output_dir()
 
         # 多文件处理相关
         self.video_files = []  # 待处理的文件列表
@@ -450,6 +1074,8 @@ class MainWindow(QMainWindow):
         self.current_video_path = None  # 当前处理中的视频路径
         self.current_burn_worker = None  # 当前合成任务
         self.current_burn_thread = None
+
+        self.init_ui()
 
     def _get_default_output_dir(self):
         """获取默认输出目录"""
@@ -558,20 +1184,58 @@ class MainWindow(QMainWindow):
 
         # 标题区域
         title_container = QWidget()
-        title_layout = QVBoxLayout(title_container)
+        title_layout = QHBoxLayout(title_container)
         title_layout.setContentsMargins(0, 0, 0, 10)
 
-        title = QLabel('🎬 智能字幕工坊')
+        # 左侧标题
+        title_left = QWidget()
+        title_left_layout = QVBoxLayout(title_left)
+        title_left_layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel('智能字幕工坊')
         title.setFont(QFont('Microsoft YaHei', 22, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet('color: #2c3e50;')
-        title_layout.addWidget(title)
 
         subtitle = QLabel('视频语音转字幕 · 支持日/英/中 · 智能翻译')
         subtitle.setFont(QFont('Microsoft YaHei', 10))
-        subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setStyleSheet('color: #7f8c8d;')
-        title_layout.addWidget(subtitle)
+
+        title_left_layout.addWidget(title)
+        title_left_layout.addWidget(subtitle)
+        title_layout.addWidget(title_left, 1)
+
+        # 右侧设置按钮 — SVG 齿轮图标
+        self.settings_btn = QPushButton()
+        self.settings_btn.setFixedSize(42, 42)
+        self.settings_btn.setToolTip('打开设置')
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        # 绘制 SVG 齿轮图标
+        gear_svg = (
+            '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke="#5d6d7e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+            '<path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="#5d6d7e" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+            '</svg>'
+        )
+        pix = QPixmap()
+        pix.loadFromData(gear_svg.encode('utf-8'))
+        self.settings_btn.setIcon(QIcon(pix))
+        self.settings_btn.setIconSize(QSize(24, 24))
+        self.settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #eef1f5;
+                border: 1px solid #dce1e8;
+                border-radius: 10px;
+            }
+            QPushButton:hover {
+                background-color: #e3e8f0;
+                border-color: #3498db;
+            }
+            QPushButton:pressed {
+                background-color: #d5dce6;
+            }
+        """)
+        self.settings_btn.clicked.connect(self.open_settings)
+        title_layout.addWidget(self.settings_btn)
 
         layout.addWidget(title_container)
 
@@ -643,6 +1307,7 @@ class MainWindow(QMainWindow):
         trans_widget = QWidget()
         trans_layout = QVBoxLayout(trans_widget)
         trans_layout.setContentsMargins(0, 0, 0, 0)
+        trans_layout.setSpacing(4)
         trans_label = QLabel('翻译功能')
         trans_label.setFont(QFont('Microsoft YaHei', 9, QFont.Bold))
         trans_layout.addWidget(trans_label)
@@ -650,29 +1315,18 @@ class MainWindow(QMainWindow):
         self.translate_combo.addItems(['不翻译', '翻译为简体中文'])
         self.translate_combo.setCurrentIndex(0)
         self.translate_combo.setMinimumWidth(150)
+        self.translate_combo.currentIndexChanged.connect(self._on_translate_option_changed)
         trans_layout.addWidget(self.translate_combo)
+
+        # 合并字幕到视频选项
+        from PyQt5.QtWidgets import QCheckBox
+        self.merge_checkbox = QCheckBox('合并字幕到视频')
+        self.merge_checkbox.setChecked(True)
+        self.merge_checkbox.setToolTip('取消勾选则只输出字幕文件，不合成带字幕的视频')
+        self.merge_checkbox.setStyleSheet('font-size: 10px; color: #7f8c8d;')
+        trans_layout.addWidget(self.merge_checkbox)
+
         step2_layout.addWidget(trans_widget)
-
-        # 输出目录
-        output_widget = QWidget()
-        output_layout = QVBoxLayout(output_widget)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_label = QLabel('输出目录')
-        output_label.setFont(QFont('Microsoft YaHei', 9, QFont.Bold))
-        output_layout.addWidget(output_label)
-
-        output_btn_layout = QHBoxLayout()
-        self.output_dir_btn = QPushButton('📁 选择目录')
-        self.output_dir_btn.setMinimumWidth(100)
-        self.output_dir_btn.clicked.connect(self.select_output_dir)
-        output_btn_layout.addWidget(self.output_dir_btn)
-
-        self.output_dir_label = QLabel('默认')
-        self.output_dir_label.setStyleSheet('color: #7f8c8d; font-size: 9px;')
-        self.output_dir_label.setToolTip(self.output_dir)
-        output_btn_layout.addWidget(self.output_dir_label)
-        output_layout.addLayout(output_btn_layout)
-        step2_layout.addWidget(output_widget)
 
         # 取消按钮（处理中可见）
         self.cancel_btn = QPushButton('⏹️ 取消任务')
@@ -737,20 +1391,73 @@ class MainWindow(QMainWindow):
         step3_group.setLayout(step3_layout)
         layout.addWidget(step3_group)
 
-    def select_output_dir(self):
-        """选择输出目录"""
-        dir_path = QFileDialog.getExistingDirectory(
+    def _on_translate_option_changed(self, index):
+        """翻译选项变更时，检查 SecretId/SecretKey 是否已配置"""
+        if index != 1:
+            # 不是"翻译为简体中文"，无需检查
+            return
+
+        # 检查凭证是否已配置（设置或环境变量）
+        has_secret_id = bool(_app_settings.get('secret_id', '').strip()) or bool(os.environ.get('SecretId', ''))
+        has_secret_key = bool(_app_settings.get('secret_key', '').strip()) or bool(os.environ.get('SecretKey', ''))
+
+        if has_secret_id and has_secret_key:
+            return  # 已配置，放行
+
+        # 未配置，弹出提示
+        reply = QMessageBox.warning(
             self,
-            '选择输出目录',
-            self.output_dir
+            '需要配置翻译 API',
+            '使用翻译功能需要配置腾讯云翻译 API 的 SecretId 和 SecretKey。\n\n'
+            '是否现在前往设置进行配置？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
         )
-        if dir_path:
-            self.output_dir = dir_path
-            # 显示简短路径
-            short_path = dir_path if len(dir_path) <= 20 else '...' + dir_path[-17:]
-            self.output_dir_label.setText(short_path)
-            self.output_dir_label.setToolTip(dir_path)
-            self.log(f'📁 输出目录已设置为: {dir_path}')
+
+        if reply == QMessageBox.Yes:
+            # 打开设置对话框
+            dialog = SettingsDialog(self)
+            dialog.settings_changed.connect(self._on_settings_changed)
+            result = dialog.exec_()
+
+            if result == QDialog.Accepted:
+                # 用户保存了设置，再次检查凭证
+                sid = _app_settings.get('secret_id', '').strip() or os.environ.get('SecretId', '')
+                skey = _app_settings.get('secret_key', '').strip() or os.environ.get('SecretKey', '')
+                if sid and skey:
+                    return  # 配置成功，保持"翻译为简体中文"
+                # 用户保存了但凭证仍为空
+                QMessageBox.information(self, '提示', 'SecretId 和 SecretKey 未填写完整，无法使用翻译功能。')
+            # 用户取消了设置对话框，回退到"不翻译"
+            self.translate_combo.blockSignals(True)
+            self.translate_combo.setCurrentIndex(0)
+            self.translate_combo.blockSignals(False)
+        else:
+            # 用户选择不配置，回退到"不翻译"
+            self.translate_combo.blockSignals(True)
+            self.translate_combo.setCurrentIndex(0)
+            self.translate_combo.blockSignals(False)
+
+    def open_settings(self):
+        """打开设置对话框"""
+        dialog = SettingsDialog(self)
+        dialog.settings_changed.connect(self._on_settings_changed)
+        dialog.exec_()
+
+    def _on_settings_changed(self, settings):
+        """设置变更后的回调"""
+        # 更新输出目录
+        output_dir = settings.get('output_dir', '')
+        if output_dir and os.path.isdir(output_dir):
+            self.output_dir = output_dir
+            self.log(f'📁 输出目录已更新: {output_dir}')
+        elif not output_dir:
+            # 恢复默认
+            self.output_dir = self._get_default_output_dir()
+            self.log('📁 输出目录已恢复为默认')
+
+        # 提示其他设置需要重新启动生效
+        self.log('✅ 设置已保存（SecretId/SecretKey 和模型路径即时生效）')
 
     def cancel_current_task(self):
         """取消当前正在运行的任务"""
@@ -966,9 +1673,18 @@ class MainWindow(QMainWindow):
             self.current_file_label.setText(f'📄 {os.path.basename(path)} - 保存字幕...')
             self._auto_save_srt(path)
 
-            # 自动合成带字幕视频
-            self.current_file_label.setText(f'📄 {os.path.basename(path)} - 合成视频...')
-            self._auto_burn_subtitles(path, result['segments'])
+            # 根据用户设置决定是否合成带字幕视频
+            if self.merge_checkbox.isChecked():
+                self.current_file_label.setText(f'📄 {os.path.basename(path)} - 合成视频...')
+                self._auto_burn_subtitles(path, result['segments'])
+            else:
+                # 不合成，直接标记完成
+                self.progress_bar.setValue(100)
+                self.current_file_label.setText(f'✅ {os.path.basename(path)} - 已完成（仅字幕）')
+                self.current_file_label.setStyleSheet('color: #27ae60; font-weight: bold;')
+                self.cancel_btn.setVisible(False)
+                self._check_all_tasks_completed()
+                self._start_next_in_queue()
         except Exception as e:
             import traceback
             print(f"[ERROR] _on_task_finished 出错: {e}")
@@ -1124,6 +1840,47 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             self.log(f'❌ 取消处理出错: {e}')
 
+    def _wrap_text(self, text, max_chars=30):
+        """智能换行文本，仅在内容过长时才断行"""
+        if not text:
+            return text
+        # 清理原文本中的换行符，统一用空格替代
+        text = text.replace('\n', ' ').replace('\r', '').strip()
+        if len(text) <= max_chars:
+            return text
+
+        result_lines = []
+        remaining = text
+
+        while len(remaining) > max_chars:
+            # 优先在标点处断行
+            punctuation = '。！？；，、）】》』」〕'
+            best_break = -1
+            for pi in range(max_chars - 1, max(0, max_chars - 10) - 1, -1):
+                if pi < len(remaining) and remaining[pi] in punctuation:
+                    best_break = pi + 1
+                    break
+
+            if best_break <= 0:
+                # 没有标点，找最后一个空格
+                for pi in range(max_chars - 1, max(0, max_chars - 10) - 1, -1):
+                    if pi < len(remaining) and remaining[pi] == ' ':
+                        best_break = pi + 1
+                        break
+
+            if best_break <= 0:
+                # 硬切
+                best_break = max_chars
+
+            result_lines.append(remaining[:best_break].strip())
+            remaining = remaining[best_break:].strip()
+
+        if remaining:
+            result_lines.append(remaining)
+
+        # 用 \N 连接多行（ASS 字幕换行符）
+        return '\\N'.join(result_lines)
+
     def _generate_ass_content(self, segments):
         """生成 ASS 字幕内容"""
         lines = [
@@ -1142,7 +1899,8 @@ class MainWindow(QMainWindow):
         for seg in segments:
             start = self._format_ass_time(seg['start'])
             end = self._format_ass_time(seg['end'])
-            text = (seg.get('translated') or seg.get('text', '')).replace('\n', '\\N').replace('\r', '')
+            raw_text = seg.get('translated') or seg.get('text', '')
+            text = self._wrap_text(raw_text, max_chars=30)
             lines.append(f'Dialogue: 0,{start},{end},Default,,0,0,0,,{text}')
 
         return '\n'.join(lines)
@@ -1306,13 +2064,33 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    print("检查依赖...")
-    check_dependencies()
+    print("智能字幕工坊 - 启动中...")
+    print("=" * 40)
+
+    # 环境检测和自动安装
+    env_ok = check_dependencies()
+
+    if not PYQT5_AVAILABLE:
+        print("[错误] PyQt5 安装失败，程序无法启动。")
+        print("[提示] 请手动执行: pip install PyQt5>=5.15.0")
+        try:
+            input("按回车键退出...")
+        except:
+            pass
+        return
+
+    print("=" * 40)
+    print("启动主界面...")
 
     app = QApplication(sys.argv)
     app.setFont(QFont('Microsoft YaHei', 10))
 
     window = MainWindow()
+
+    # 如果环境检测有警告（如 FFmpeg 缺失），在日志中提示
+    if not env_ok:
+        window.log('⚠️ 部分环境依赖未就绪，请检查设置或查看启动日志')
+
     window.show()
 
     sys.exit(app.exec_())

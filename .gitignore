@@ -5,6 +5,7 @@ __pycache__/
 .eggs/
 dist/
 build/
+*.spec
 
 # Node
 node_modules/
@@ -21,13 +22,12 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-# Whisper models
+# Whisper models (large files)
 whisper/*.pt
 
 # Temporary files
 *.tmp
 *.temp
-*.pyc
 
 # WorkBuddy
 .workbuddy/
@@ -36,3 +36,9 @@ whisper/*.pt
 venv/
 env/
 .venv/
+
+# Output (generated files)
+output/
+
+# User config (contains API keys!)
+config.json
